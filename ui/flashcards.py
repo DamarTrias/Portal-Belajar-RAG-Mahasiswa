@@ -1,61 +1,103 @@
-"""Tampilan tab Flashcard Pintar untuk metode belajar active recall."""
+"""Tab Flashcard Pintar untuk metode belajar active recall."""
 from typing import Any, Dict
 
 import streamlit as st
 
-from core.generator import make_flashcards
+from core.generator import delete_flashcards, load_flashcards, make_flashcards, save_flashcards
 from ui.common import pick_document
 
 
 def render(student: Dict[str, Any]) -> None:
-    """
-    Merender antarmuka flashcard interaktif per mahasiswa.
-    Status kartu (indeks aktif dan sisi yang terlihat) disimpan di session_state.
-    """
+    # Tampilan flashcard interaktif per mahasiswa dengan persistensi database
     col_config, col_display = st.columns([1, 2])
 
-    # Kunci session_state unik per mahasiswa.
+    # Kunci session_state untuk kartu aktif dan status flip
     cards_key = f"cards_{student['id']}"
     current_index_key = f"card_idx_{student['id']}"
     is_flipped_key = f"card_flip_{student['id']}"
+    cards_doc_key = f"cards_src_doc_{student['id']}"
 
-    # Inisialisasi state awal jika belum ada.
     if current_index_key not in st.session_state:
         st.session_state[current_index_key] = 0
     if is_flipped_key not in st.session_state:
         st.session_state[is_flipped_key] = False
 
+    # Sidebar: Konfigurasi dan aksi kartu (Buat, Muat, Hapus)
     with col_config:
         st.subheader("Buat Flashcard")
-        st.caption("Flashcard dibuat dari maksimal 15 potongan materi yang dipilih secara merata. Kartu hanya tersimpan selama sesi aplikasi.")
+        st.caption("Flashcard dibuat dari potongan materi merata dan disimpan permanen di database.")
 
         doc_id = pick_document(student["id"], label="Pilih Dokumen Sumber:", key=f"cards_doc_{student['id']}")
         card_count = st.selectbox("Jumlah Kartu:", [5, 10, 15], key=f"cards_qty_{student['id']}")
 
+        # Tombol 1: Buat baru dan simpan ke Supabase
         if st.button("✨ Buat Flashcard Baru", type="primary", use_container_width=True, key=f"cards_btn_{student['id']}"):
             with st.spinner("Mengekstrak konsep & membuat flashcard..."):
                 try:
-                    new_cards = make_flashcards(
-                            student_id=student["id"],
-                            doc_id=doc_id,
-                            card_count=card_count,
-                        )
+                    new_cards, selected_count, total_count = make_flashcards(
+                        student_id=student["id"],
+                        doc_id=doc_id,
+                        card_count=card_count,
+                    )
+                    save_flashcards(student["id"], doc_id, new_cards)
+
                     st.session_state[cards_key] = new_cards
+                    st.session_state[cards_doc_key] = doc_id
                     st.session_state[current_index_key] = 0
                     st.session_state[is_flipped_key] = False
+                    st.session_state[f"cards_coverage_{student['id']}"] = (selected_count, total_count)
                     st.rerun()
                 except Exception as error:
                     st.error(f"Gagal membuat flashcard: {error}")
 
+        st.markdown("---")
+
+        # Tombol 2: Muat kartu yang sudah pernah disimpan
+        if st.button("📂 Muat Flashcard Tersimpan", use_container_width=True, key=f"cards_load_{student['id']}"):
+            with st.spinner("Memuat flashcard dari database..."):
+                try:
+                    saved_cards = load_flashcards(student["id"], doc_id)
+                    if saved_cards:
+                        st.session_state[cards_key] = saved_cards
+                        st.session_state[cards_doc_key] = doc_id
+                        st.session_state[current_index_key] = 0
+                        st.session_state[is_flipped_key] = False
+                        st.session_state.pop(f"cards_coverage_{student['id']}", None)
+                        st.rerun()
+                    else:
+                        st.info("Belum ada flashcard tersimpan untuk dokumen ini.")
+                except Exception as error:
+                    st.error(f"Gagal memuat flashcard: {error}")
+
+        # Tombol 3: Hapus kartu dari database
+        if st.button("🗑️ Hapus Flashcard Tersimpan", use_container_width=True, key=f"cards_del_{student['id']}"):
+            with st.spinner("Menghapus flashcard dari database..."):
+                try:
+                    delete_flashcards(student["id"], doc_id)
+                    st.session_state.pop(cards_key, None)
+                    st.session_state[current_index_key] = 0
+                    st.session_state[is_flipped_key] = False
+                    st.success("Flashcard berhasil dihapus dari database.")
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Gagal menghapus flashcard: {error}")
+
+    # Kolom Utama: Tampilan kartu interaktif (bolak-balik)
     with col_display:
         st.subheader("Flashcard Pintar")
         card_list = st.session_state.get(cards_key)
 
         if not card_list:
-            st.info("Pilih dokumen dan klik 'Buat Flashcard Baru' untuk mulai belajar.")
+            st.info("Pilih dokumen lalu klik 'Buat Flashcard Baru' atau 'Muat Flashcard Tersimpan'.")
             return
 
-        # Pastikan indeks tidak melebihi panjang daftar kartu.
+        # Indikator cakupan materi
+        coverage = st.session_state.get(f"cards_coverage_{student['id']}")
+        if coverage:
+            sel, tot = coverage
+            st.caption(f"📊 Flashcard dibuat dari **{sel}** dari **{tot}** potongan materi yang tersedia.")
+
+        # Ambil kartu aktif saat ini
         current_index = st.session_state[current_index_key]
         if current_index >= len(card_list):
             current_index = 0
@@ -64,7 +106,7 @@ def render(student: Dict[str, Any]) -> None:
         current_card = card_list[current_index]
         is_flipped = st.session_state[is_flipped_key]
 
-        # Tentukan tampilan kartu berdasarkan sisi yang sedang dilihat.
+        # Tampilan sisi depan / belakang kartu
         card_title = "💡 JAWABAN & PENJELASAN" if is_flipped else "❓ PERTANYAAN / KONSEP"
         card_content = current_card.belakang if is_flipped else current_card.depan
         card_border_color = "#10b981" if is_flipped else "#3b82f6"
@@ -76,7 +118,7 @@ def render(student: Dict[str, Any]) -> None:
         </div>
         """, unsafe_allow_html=True)
 
-        # Tombol navigasi: Sebelumnya | Balik Kartu | Berikutnya
+        # Navigasi: Sebelumnya | Balik Kartu | Berikutnya
         col_prev, col_flip, col_next = st.columns([1, 1.5, 1])
 
         with col_prev:
@@ -98,3 +140,4 @@ def render(student: Dict[str, Any]) -> None:
                 st.rerun()
 
         st.caption(f"<div style='text-align: center; margin-top: 10px;'>Kartu {current_index + 1} dari {len(card_list)}</div>", unsafe_allow_html=True)
+

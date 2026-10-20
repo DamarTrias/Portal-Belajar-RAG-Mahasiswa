@@ -1,6 +1,6 @@
-"""Alur RAG: pemrosesan materi, pencarian konteks semantik, dan jawaban bersitasi."""
+"""Alur RAG: Ingest dokumen, retrieve konteks, dan generate jawaban bersitasi."""
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -8,47 +8,90 @@ from core.ai import embeddings, llm, to_text
 from core.db import db
 from core.loader import load_file
 
-# Pembagi teks: memotong dokumen menjadi chunk ~800 karakter dengan tumpang-tindih 120 karakter.
+# Potong dokumen jadi chunk ~800 karakter dengan overlap 120 karakter
 splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
 
 
-def ingest(student_id: str, filename: str, data: bytes) -> int:
-    """
-    Membaca berkas, memecahnya menjadi chunk, membuat vektor embedding,
-    lalu menyimpan metadata dokumen dan chunk ke Supabase.
-    Mengembalikan jumlah chunk yang berhasil disimpan.
-    """
-    pages, file_extension = load_file(filename, data)
+# --- Fungsi Pembantu (Helper) ---
 
-    # Pecah setiap halaman/slide menjadi chunk dan buat label sitasinya.
-    texts: List[str] = []
-    citations: List[str] = []
+def _format_context(chunks: List[Dict[str, Any]]) -> str:
+    # Format chunk materi menjadi teks bernomor rujukan [1], [2], dst.
+    return "\n\n".join(
+        f"[{i}] ({c['citation']})\n{c['content']}" 
+        for i, c in enumerate(chunks, 1)
+    )
+
+
+def _format_history(history: Optional[Sequence[Dict[str, str]]], max_turns: int = 3) -> str:
+    # Ambil maksimal 3 pasang tanya-jawab terakhir sebagai konteks percakapan
+    if not history:
+        return ""
+    recent = history[-(max_turns * 2):]
+    lines = [
+        f"{'Mahasiswa' if m.get('role') == 'user' else 'Asisten'}: {m.get('text', '').strip()}"
+        for m in recent if m.get('text', '').strip()
+    ]
+    return "RIWAYAT PERCAKAPAN TERAKHIR:\n" + "\n".join(lines) + "\n\n" if lines else ""
+
+
+def _clean_invalid_citations(text: str, max_ref: int) -> str:
+    # Hapus nomor sitasi di luar rentang sumber (misal: [6] padahal cuma ada 3 sumber)
+    def _keep_valid(match: re.Match) -> str:
+        num = int(match.group(1))
+        return match.group(0) if 1 <= num <= max_ref else ""
+
+    return re.sub(r"\[(\d+)\]", _keep_valid, text).strip()
+
+
+def _extract_cited_numbers(text: str, max_ref: int) -> List[int]:
+    # Ambil daftar nomor rujukan yang benar-benar ada di dalam jawaban
+    return sorted({
+        int(n) for n in re.findall(r"\[(\d+)\]", text)
+        if n.isdigit() and 1 <= int(n) <= max_ref
+    })
+
+
+def _build_source_checklist(chunks: List[Dict[str, Any]], cited: List[int]) -> List[str]:
+    # Tandai ✅ untuk sumber yang dikutip, atau — untuk sumber pelengkap
+    return [
+        f"{'✅' if i in cited else '—'} [{i}] {c['citation']}"
+        for i, c in enumerate(chunks, 1)
+    ]
+
+
+# --- 1. Ingest (Simpan Dokumen ke Database Vektor) ---
+
+def ingest(student_id: str, filename: str, data: bytes) -> int:
+    # 1. Ekstrak teks dari file
+    pages, file_ext = load_file(filename, data)
+
+    # 2. Pecah teks menjadi chunk dan buat label sitasinya
+    texts, citations = [], []
     for page_text, page_label in pages:
         for chunk in splitter.split_text(page_text):
-            cleaned_chunk = chunk.strip()
-            if cleaned_chunk:
-                texts.append(cleaned_chunk)
+            if chunk.strip():
+                texts.append(chunk.strip())
                 citations.append(f"{filename} ({page_label})")
 
     if not texts:
         raise ValueError("Tidak ada teks atau gambar materi yang dapat dibaca dari file ini.")
 
-    # Buat vektor embedding untuk semua chunk sekaligus (satu API call).
+    # 3. Buat vektor embedding untuk tiap chunk
     vectors = embeddings.embed_documents(texts)
 
-    # Simpan metadata dokumen terlebih dahulu untuk mendapatkan doc_id.
-    doc_response = db.table("documents").insert({
+    # 4. Simpan metadata dokumen ke tabel 'documents'
+    doc_res = db.table("documents").insert({
         "student_id": student_id,
         "name": filename,
-        "file_type": file_extension,
+        "file_type": file_ext,
     }).execute()
 
-    if not doc_response.data:
-        raise RuntimeError("Gagal menyimpan metadata dokumen ke Supabase.")
+    if not doc_res.data:
+        raise RuntimeError("Gagal menyimpan dokumen ke database.")
 
-    doc_id = doc_response.data[0]["id"]
+    doc_id = doc_res.data[0]["id"]
 
-    # Susun baris yang akan dimasukkan ke tabel chunks.
+    # 5. Simpan chunk dan vektor embedding ke tabel 'chunks' (per batch 50 baris)
     chunk_rows = [
         {
             "document_id": doc_id,
@@ -60,23 +103,24 @@ def ingest(student_id: str, filename: str, data: bytes) -> int:
         for text, citation, vector in zip(texts, citations, vectors)
     ]
 
-    # Masukkan chunk dalam batch 50 baris untuk menghindari batas ukuran request.
-    batch_size = 50
-    for batch_start in range(0, len(chunk_rows), batch_size):
-        db.table("chunks").insert(chunk_rows[batch_start:batch_start + batch_size]).execute()
+    for start in range(0, len(chunk_rows), 50):
+        db.table("chunks").insert(chunk_rows[start:start + 50]).execute()
 
     return len(chunk_rows)
 
 
-def retrieve(student_id: str, question: str, doc_id: Optional[str] = None, top_k: int = 5) -> List[Dict[str, Any]]:
-    """
-    Mengambil maksimal top_k chunk yang paling relevan secara semantik terhadap pertanyaan.
-    Pencarian menggunakan fungsi RPC `match_chunks` yang mengurutkan berdasarkan cosine distance.
-    Filter student_id dan doc_id memastikan isolasi data per mahasiswa.
-    """
+# --- 2. Retrieve (Pencarian Vektor Relevan) ---
+
+def retrieve(
+    student_id: str,
+    question: str,
+    doc_id: Optional[str] = None,
+    top_k: int = 5,
+) -> List[Dict[str, Any]]:
     if not question.strip():
         return []
 
+    # Ubah pertanyaan jadi vektor lalu cari chunk terdekat via match_chunks di Supabase
     query_vector = embeddings.embed_query(question)
     rpc_params = {
         "query_embedding": query_vector,
@@ -88,47 +132,48 @@ def retrieve(student_id: str, question: str, doc_id: Optional[str] = None, top_k
     return response.data or []
 
 
-def answer(student_id: str, question: str, doc_id: Optional[str] = None) -> Tuple[str, List[str]]:
-    """
-    Menjawab pertanyaan berdasarkan 5 chunk teratas dari retrieval.
-    Mengembalikan tuple (teks_jawaban, list_sitasi_yang_digunakan).
-    Model diminta mencantumkan nomor rujukan [1]-[5] pada klaim yang didukung konteks.
-    """
-    retrieved_chunks = retrieve(student_id, question, doc_id=doc_id, top_k=5)
+# --- 3. Answer (Jawab Pertanyaan dengan Sitasi) ---
 
-    if not retrieved_chunks:
-        return (
-            "Materi terkait tidak ditemukan dalam dokumen Anda. Pastikan Anda telah mengunggah materi yang sesuai.",
-            [],
-        )
+def answer(
+    student_id: str,
+    question: str,
+    doc_id: Optional[str] = None,
+    history: Optional[Sequence[Dict[str, str]]] = None,
+) -> Tuple[str, List[str]]:
+    # 1. Cari 5 potongan materi paling relevan
+    chunks = retrieve(student_id, question, doc_id=doc_id, top_k=5)
+    if not chunks:
+        return "Materi terkait tidak ditemukan dalam dokumen Anda. Pastikan sudah mengunggah materi yang sesuai.", []
 
-    # Susun konteks dengan nomor rujukan agar model bisa mengutip sumber secara spesifik.
-    context = "\n\n".join(
-        f"[{ref_num}] ({chunk['citation']})\n{chunk['content']}"
-        for ref_num, chunk in enumerate(retrieved_chunks, 1)
-    )
+    total_sources = len(chunks)
 
+    # 2. Siapkan konteks rujukan dan riwayat percakapan
+    context_text = _format_context(chunks)
+    history_text = _format_history(history, max_turns=3)
+
+    # 3. Susun prompt untuk LLM
     prompt = (
         "Anda adalah asisten akademik. Jawab dengan bahasa Indonesia yang jelas dan hanya berdasarkan konteks di bawah.\n"
-        "Cantumkan nomor rujukan [1] sampai [5] pada klaim yang didukung oleh konteks. Jangan mencantumkan nomor yang tidak digunakan.\n"
+        f"Cantumkan nomor rujukan [1] sampai [{total_sources}] pada klaim yang didukung oleh konteks.\n"
+        "PENTING: Hanya gunakan nomor rujukan yang benar-benar ada di daftar konteks. "
+        "Jangan mencantumkan nomor yang tidak digunakan atau di luar rentang.\n"
         "Jika informasi tidak ditemukan dalam konteks, nyatakan bahwa materi belum memuat informasi tersebut.\n\n"
-        f"KONTEKS MATERI:\n{context}\n\nPERTANYAAN: {question}\n\nJAWABAN:"
+        f"{history_text}"
+        f"KONTEKS MATERI:\n{context_text}\n\n"
+        f"PERTANYAAN: {question}\n\n"
+        "JAWABAN:"
     )
 
+    # 4. Dapatkan jawaban dari LLM
     raw_answer = to_text(llm.invoke(prompt)).strip()
 
-    # Ekstrak nomor rujukan yang benar-benar digunakan dalam jawaban.
-    used_ref_numbers = sorted({
-        int(citation_num)
-        for citation_num in re.findall(r"\[(\d+)\]", raw_answer)
-        if citation_num.isdigit() and 1 <= int(citation_num) <= len(retrieved_chunks)
-    })
-    source_list = [f"[{ref_number}] {retrieved_chunks[ref_number - 1]['citation']}" for ref_number in used_ref_numbers]
+    # 5. Bersihkan nomor sitasi yang tidak valid dan buat daftar rujukan
+    clean_answer = _clean_invalid_citations(raw_answer, max_ref=total_sources)
+    used_citations = _extract_cited_numbers(clean_answer, max_ref=total_sources)
+    source_list = _build_source_checklist(chunks, used_citations)
 
-    if not source_list:
-        raw_answer += (
-            "\n\nCatatan: jawaban tidak memuat nomor sitasi yang dapat dicocokkan "
-            "dengan potongan materi yang ditemukan."
-        )
+    # Catatan jika tidak ada sitasi yang tercantum
+    if not used_citations:
+        clean_answer += "\n\nCatatan: jawaban tidak memuat nomor sitasi yang dapat dicocokkan dengan potongan materi yang ditemukan."
 
-    return raw_answer, source_list
+    return clean_answer, source_list

@@ -45,8 +45,18 @@ language sql stable as $$
   limit greatest(match_count, 0);
 $$;
 
+create table if not exists flashcards (
+  id bigserial primary key,
+  student_id uuid not null references students(id) on delete cascade,
+  document_id uuid references documents(id) on delete cascade,
+  front text not null,
+  back text not null,
+  created_at timestamptz default now()
+);
+
 -- Koneksi aplikasi di server menggunakan service key.
 -- RLS diaktifkan, tetapi pembatasan pada jalur aplikasi diterapkan melalui filter student_id.
 alter table students enable row level security;
 alter table documents enable row level security;
 alter table chunks enable row level security;
+alter table flashcards enable row level security;
